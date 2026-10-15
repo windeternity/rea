@@ -6,7 +6,10 @@ import {
   AnalysisInputError,
   AnalysisUnsupportedTargetError,
 } from "../../domain/analysisErrorCore.js";
-import { projectPlistValue } from "../../domain/apple/plistValue.js";
+import {
+  projectPlistValue,
+  unknownDateLimitation,
+} from "../../domain/apple/plistValue.js";
 import { createPlistNumberProjection } from "../../domain/apple/plistNumbers.js";
 import {
   binaryPlistNumberLiterals,
@@ -27,6 +30,10 @@ import { ArtifactReaderFailure } from "../ArtifactReader.js";
 import type { ArtifactEntry } from "../ArtifactReader.js";
 
 import { decodeXmlPlistText } from "../../domain/propertyListXmlText.js";
+import {
+  hasBinaryPlistSignature,
+  hasNibArchiveSignature,
+} from "../../domain/apple/appleArchiveFormat.js";
 import { estimateBinaryPlistExpansion } from "./InterfaceBuilderDecodeBudget.js";
 
 const MAX_BYTES = 64 * 1024 * 1024;
@@ -40,12 +47,12 @@ export const decodeKeyedArchiveBytes = (
 ) => {
   if (bytes.length > MAX_BYTES)
     throw new RangeError("Keyed archive exceeds 64 MiB");
-  if (bytes.subarray(0, 10).toString("ascii") === "NIBArchive")
+  if (hasNibArchiveSignature(bytes))
     throw new KeyedArchiveKindError(
       "Selected file is a compiled NIBArchive, not a Foundation plist archive; decode it with decode_interface_builder",
       "nib-archive",
     );
-  const binary = bytes.subarray(0, 8).toString("ascii") === "bplist00";
+  const binary = hasBinaryPlistSignature(bytes);
   const xmlText = binary ? undefined : decodeXmlPlistText(bytes);
   // plist.parseBinary recurses on every object reference and copies shared
   // containers, so a few hundred bytes can exhaust memory or the stack.
@@ -71,9 +78,11 @@ export const decodeKeyedArchiveBytes = (
             : 0,
         }
       : parseXmlPropertyList(xmlText ?? "");
-  const { value: plistValue, unknownRealCount } = projectPlistValue(
-    parsed.value,
-  );
+  const {
+    value: plistValue,
+    unknownRealCount,
+    unknownDateCount,
+  } = projectPlistValue(parsed.value);
   const graph = projectKeyedArchive(plistValue, selection);
   const numbers = createPlistNumberProjection(
     binary
@@ -108,6 +117,9 @@ export const decodeKeyedArchiveBytes = (
         : [
             `${String(unknownRealCount)} non-finite real value(s) are reported as { "$plist_type": "real", "value": null } because JSON evidence cannot preserve NaN vs infinity.`,
           ]),
+      ...(unknownDateCount === 0
+        ? []
+        : [unknownDateLimitation(unknownDateCount)]),
     ],
   };
 };

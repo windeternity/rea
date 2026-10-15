@@ -1,4 +1,12 @@
-import { parse } from "plist";
+import {
+  DOMParser,
+  normalizeLineEndings,
+  type Document,
+  type Node,
+} from "@xmldom/xmldom";
+import { parse, parseOpenStep } from "plist";
+
+import { MAX_PLIST_DEPTH } from "./apple/plistValue.js";
 
 /** The dictionary key REA results cannot carry: validation strips it. */
 const PROTOTYPE_KEY = "__proto__";
@@ -46,10 +54,6 @@ export const omitPrototypeKeys = (
   value: unknown,
 ): PropertyListWithoutPrototypeKeys => withoutKey(value, PROTOTYPE_KEY);
 
-// Comments and CDATA text are consumed whole so only element keys match.
-const KEY_TOKEN =
-  /<!--[\s\S]*?-->|<!\[CDATA\[[\s\S]*?\]\]>|<key>([^<]*)<\/key>|<key><!\[CDATA\[([\s\S]*?)\]\]><\/key>/gu;
-
 const XML_ENTITIES: Readonly<Record<string, string>> = {
   amp: "&",
   apos: "'",
@@ -87,18 +91,270 @@ export const decodeXmlText = (text: string): string =>
 export const parseXmlPropertyList = (
   text: string,
 ): PropertyListWithoutPrototypeKeys => {
-  // The decoded text holds every key the decoder can produce, including
-  // entity-encoded spellings of the placeholder, so no source key aliases it.
-  // Decoding comment or CDATA text too can only lengthen the placeholder.
-  const decoded = decodeXmlText(text);
-  let placeholder = "__rea_prototype_key__";
-  while (decoded.includes(placeholder)) placeholder = `_${placeholder}`;
-  const substituted = text.replace(
-    KEY_TOKEN,
-    (token, plain?: string, cdata?: string) =>
-      (plain === undefined ? cdata : decodeXmlText(plain)) === PROTOTYPE_KEY
-        ? `<key>${placeholder}</key>`
-        : token,
+  // Preserve the pinned decoder's existing OpenStep autodetection, also used
+  // by app Info.plist resolution. Only XML needs the key-element substitution.
+  const first = text.trimStart()[0];
+  if (first === "{" || first === "(") {
+    // The pinned decoder assigns a `__proto__` key to the object prototype, so
+    // the entry is gone before the decoded value can be counted. Count keys in
+    // the source instead; the rebuild still drops any prototype it replaced.
+    const prototypeKeys = scanOpenStep(text);
+    return {
+      value: omitPrototypeKeys(parse(text)).value,
+      omittedPrototypeKeys: prototypeKeys,
+    };
+  }
+  // Normalize only the literal line endings the pinned decoder normalizes.
+  // Preserve character references in the source: serializing a DOM would turn
+  // e.g. an encoded carriage return into a literal newline on the second parse.
+  const normalized = normalizeLineEndings(text);
+  // The pinned XML parser is iterative. Reuse its document for the depth
+  // preflight and key lookup so quoted attributes and declarations have the
+  // same meaning at both boundaries, before plist's recursive value decode.
+  const document = new DOMParser().parseFromString(normalized, "text/xml");
+  assertXmlPlistDepthWithinLimit(document);
+  const { substituted, placeholder } = substitutePrototypeKeys(
+    normalized,
+    document,
   );
   return withoutKey(parse(substituted), placeholder);
+};
+
+interface OpenStepContainer {
+  end: string;
+  next: "key" | "equals" | "value" | "separator" | "after-value";
+  /** Source offset of a container that is itself a dictionary key. */
+  keyStart?: number;
+}
+
+/** Consume only the punctuation expected between the pinned decoder's values. */
+const consumeOpenStepSeparator = (
+  parent: OpenStepContainer | undefined,
+  character: string,
+): "consumed" | "invalid" | "none" => {
+  if (parent?.next === "after-value") {
+    parent.next = "key";
+    return character === ";" ? "consumed" : "none";
+  }
+  if (parent?.next !== "equals" && parent?.next !== "separator") return "none";
+  if (character !== (parent.next === "equals" ? "=" : ",")) return "invalid";
+  parent.next = "value";
+  return "consumed";
+};
+
+/** An array may close after a comma; a dictionary still needs its assigned value. */
+const admitsOpenStepCloser = (
+  parent: OpenStepContainer | undefined,
+  character: string,
+): boolean =>
+  parent?.end === character &&
+  parent.next !== "equals" &&
+  !(parent.end === "}" && parent.next === "value");
+
+/**
+ * Bound OpenStep value nesting before the pinned decoder recursively reads it,
+ * and count the dictionary keys that decode to `__proto__`.
+ */
+const scanOpenStep = (text: string): number => {
+  let prototypeKeys = 0;
+  const containers: OpenStepContainer[] = [];
+  const completeValue = (): void => {
+    const parent = containers.at(-1);
+    if (parent !== undefined)
+      parent.next =
+        parent.next === "key"
+          ? "equals"
+          : parent.end === "}"
+            ? "after-value"
+            : "separator";
+  };
+  const assertDepth = (): void => {
+    if (containers.length > MAX_PLIST_DEPTH)
+      throw new RangeError(
+        `Plist exceeds ${String(MAX_PLIST_DEPTH)} nesting levels`,
+      );
+  };
+  let cursor = 0;
+  while (cursor < text.length) {
+    const afterTrivia = skipOpenStepTrivia(text, cursor);
+    if (afterTrivia !== cursor) {
+      cursor = afterTrivia;
+      continue;
+    }
+    const character = text[cursor] ?? "";
+    const parent = containers.at(-1);
+    // Stop at the first impossible token: only the pinned decoder owns syntax
+    // diagnostics. A later deep suffix cannot change that failure into a limit.
+    if (character === "}" || character === ")") {
+      if (!admitsOpenStepCloser(parent, character)) return prototypeKeys;
+      const closed = containers.pop();
+      if (
+        closed?.keyStart !== undefined &&
+        isOpenStepPrototypeKey(text.slice(closed.keyStart, cursor + 1))
+      )
+        prototypeKeys += 1;
+      // parseOpenStep returns the first root value without reading trailing text.
+      if (containers.length === 0) return prototypeKeys;
+      completeValue();
+      cursor += 1;
+      continue;
+    }
+    const separator = consumeOpenStepSeparator(parent, character);
+    if (separator === "invalid") return prototypeKeys;
+    if (separator === "consumed") {
+      cursor += 1;
+      continue;
+    }
+    if (character === "{" || character === "(") {
+      assertDepth();
+      containers.push({
+        end: character === "{" ? "}" : ")",
+        next: character === "{" ? "key" : "value",
+        // A compound key is coerced to a string, e.g. `(__proto__)`.
+        ...(parent?.next === "key" ? { keyStart: cursor } : {}),
+      });
+      cursor += 1;
+      continue;
+    }
+    const end = skipOpenStepScalar(text, cursor);
+    if (end === cursor) return prototypeKeys;
+    if (parent?.next === "key") {
+      if (isOpenStepPrototypeKey(text.slice(cursor, end))) prototypeKeys += 1;
+    } else assertDepth();
+    cursor = end;
+    completeValue();
+  }
+  return prototypeKeys;
+};
+
+/**
+ * Whether one OpenStep key, scalar or compound, becomes the property name
+ * `__proto__` when the decoder assigns `obj[key]`. Plain strings compare
+ * directly; any other key is decoded by the pinned decoder itself and
+ * coerced to a property name the same way that assignment does.
+ */
+const isOpenStepPrototypeKey = (token: string): boolean => {
+  if (!/^["({<]/u.test(token)) return token === PROTOTYPE_KEY;
+  if (token.startsWith('"') && !token.includes("\\"))
+    return token === `"${PROTOTYPE_KEY}"`;
+  try {
+    return String(parseOpenStep(token)) === PROTOTYPE_KEY;
+  } catch {
+    // An unterminated token is the decoder's syntax error to report.
+    return false;
+  }
+};
+
+/** Skip grammar trivia without interpreting delimiter examples inside comments. */
+const skipOpenStepTrivia = (text: string, cursor: number): number => {
+  if (/\s/u.test(text[cursor] ?? "")) return cursor + 1;
+  if (!text.startsWith("//", cursor) && !text.startsWith("/*", cursor))
+    return cursor;
+  const line = text[cursor + 1] === "/";
+  const end = text.indexOf(line ? "\n" : "*/", cursor + 2);
+  return end === -1 ? text.length : end + (line ? 1 : 2);
+};
+
+/** Read the extent of one opaque scalar; the pinned decoder still owns its value. */
+const skipOpenStepScalar = (text: string, start: number): number => {
+  let cursor = start;
+  const character = text[cursor];
+  if (character === '"') {
+    cursor += 1;
+    while (cursor < text.length) {
+      const next = text[cursor];
+      cursor += next === "\\" ? 2 : 1;
+      if (next === '"') break;
+    }
+  } else if (character === "<") {
+    const end = text.indexOf(">", cursor + 1);
+    cursor = end === -1 ? text.length : end + 1;
+  } else {
+    // Match the pinned OpenStep decoder's unquoted-string alphabet. Other
+    // syntax remains for the decoder to reject; preflight only owns depth.
+    while (
+      cursor < text.length &&
+      /[a-zA-Z0-9._/$:-]/u.test(text[cursor] ?? "")
+    )
+      cursor += 1;
+  }
+  return cursor;
+};
+
+/** Elements whose children the pinned plist value decoder visits recursively. */
+const PLIST_CONTAINER_ELEMENTS = new Set(["plist", "dict", "array"]);
+
+/**
+ * Reject XML plists nested deeper than the projection supports before any
+ * recursive value pass runs. `plist` and the prototype-key traversal recurse once
+ * per nesting level, so a deeply nested document exhausts the call stack
+ * before the projection limit can report the resource bound. The failure
+ * matches `projectPlistValue` so callers classify it as a limit failure.
+ *
+ * Depth counts values the way the projection does: the root value is level 0
+ * and every container member is one level deeper. A dictionary key names a
+ * member instead of nesting one, and a self-closing element is the value at
+ * its own level. The outer plist envelope is unwrapped by the decoder;
+ * nested plist elements decode as arrays and must count toward the bound.
+ */
+const assertXmlPlistDepthWithinLimit = (document: Document): void => {
+  const root = document.documentElement;
+  if (root === null) return;
+  const pending: Array<{ node: Node; depth: number }> = [
+    { node: root, depth: -1 },
+  ];
+  while (pending.length > 0) {
+    const entry = pending.pop();
+    if (entry === undefined) break;
+    const { node, depth } = entry;
+    // Schedule only the next sibling, keeping traversal storage proportional
+    // to depth rather than the number of members in a wide container.
+    if (node.nextSibling !== null)
+      pending.push({ node: node.nextSibling, depth });
+    if (node.nodeType !== node.ELEMENT_NODE) continue;
+    if (node.nodeName !== "key" && depth > MAX_PLIST_DEPTH)
+      throw new RangeError(
+        `Plist exceeds ${String(MAX_PLIST_DEPTH)} nesting levels`,
+      );
+    if (PLIST_CONTAINER_ELEMENTS.has(node.nodeName) && node.firstChild !== null)
+      pending.push({ node: node.firstChild, depth: depth + 1 });
+  }
+};
+
+/** Locate keys with the same XML parser and first-child semantics as plist. */
+const substitutePrototypeKeys = (text: string, document: Document) => {
+  const keys = Array.from(document.getElementsByTagName("key"));
+  const decodedKeys = new Set(keys.map((key) => key.firstChild?.nodeValue));
+  let placeholder = "__rea_prototype_key__";
+  while (decodedKeys.has(placeholder)) placeholder = `_${placeholder}`;
+
+  const omitted = keys
+    .map((key) => key.firstChild)
+    .filter((node) => node?.nodeValue === PROTOTYPE_KEY);
+  if (omitted.length === 0) return { substituted: text, placeholder };
+
+  // xmldom uses one-based locators in document order. Scan forward only to
+  // needed lines instead of retaining an offset for every source newline.
+  let line = 1;
+  let lineStart = 0;
+  const parts: string[] = [];
+  let cursor = 0;
+  for (const node of omitted) {
+    const nodeLine = node?.lineNumber;
+    const column = node?.columnNumber;
+    if (nodeLine === undefined || column === undefined)
+      throw new TypeError("XML plist key has no source location");
+    while (line < nodeLine) {
+      const newline = text.indexOf("\n", lineStart);
+      if (newline === -1)
+        throw new TypeError("XML plist key has an invalid source location");
+      lineStart = newline + 1;
+      line += 1;
+    }
+    const offset = lineStart + column - 1;
+    parts.push(text.slice(cursor, offset), `<![CDATA[${placeholder}]]>`);
+    cursor = offset;
+  }
+  parts.push(text.slice(cursor));
+  return { substituted: parts.join(""), placeholder };
 };

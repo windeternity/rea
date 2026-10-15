@@ -1,12 +1,13 @@
 import { execFile } from "node:child_process";
-import { copyFile, mkdir, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { copyFile, mkdir, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { join, relative, resolve } from "node:path";
 import { promisify } from "node:util";
 
 import { Client } from "@modelcontextprotocol/client";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it } from "vitest";
 
 import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
 import { writeElectronApiAliasApplication } from "../../fixtures/electronApiAliasApplication.js";
@@ -17,6 +18,7 @@ import {
   SOURCE_TO_BUNDLE_COMPARISON_EXAMPLE,
 } from "../../../src/contracts/javascript/javascriptApplicationWorkflowExamples.js";
 import { analyzeJavaScriptApplication } from "../../support/javascriptApplicationScope.js";
+import { parseEvidence } from "../../../src/domain/evidence.js";
 import {
   javascriptApplicationAnalysisResultSchema,
   type JavaScriptApplicationAnalysisResult,
@@ -24,9 +26,37 @@ import {
 import { parseJavaScriptApplicationGraph } from "../../../src/domain/javascript/javascriptApplicationGraph.js";
 import { z } from "zod";
 
+import { ELECTRON_IDENTITY_LIMITATION } from "../../../src/domain/javascript/javascriptElectronMemberWrites.js";
+
 const execute = promisify(execFile);
 const requireFixture = createRequire(import.meta.url);
-const temporary: string[] = [];
+// Analysis requests are stateless; retain one compiled server and its SDK
+// validators while every scenario still owns a separate application directory.
+const mcpTransport = new StdioClientTransport({
+  command: process.execPath,
+  args: [resolve("scripts/rea.mjs"), "mcp"],
+  cwd: process.cwd(),
+  env: { PATH: process.env.PATH ?? "", REA_LOG_LEVEL: "silent" },
+  stderr: "pipe",
+});
+mcpTransport.stderr?.on("data", () => undefined);
+const mcpClient = new Client({
+  name: "application-workflow-parity",
+  version: "1",
+});
+let mcpConnection: Promise<void> | undefined;
+const connectedMcpClient = async (): Promise<Client> => {
+  await (mcpConnection ??= mcpClient.connect(mcpTransport));
+  return mcpClient;
+};
+
+afterAll(async () => {
+  try {
+    await mcpClient.close();
+  } finally {
+    await mcpTransport.close();
+  }
+});
 const WEBPACK_FACTORY_BODY = `
   const key = "dynamic";
   const __webpack_require__ = {
@@ -54,14 +84,6 @@ const WEBPACK_FACTORY_BODY = `
   __webpack_require__.d(exports, { "from.helper": () => 7 });
   exports = function ignored() { return 8; };
 `;
-
-afterEach(async () => {
-  await Promise.all(
-    temporary
-      .splice(0)
-      .map(async (path) => rm(path, { recursive: true, force: true })),
-  );
-});
 
 const writeSelfImportFixture = async (root: string): Promise<void> => {
   await Promise.all([
@@ -160,51 +182,463 @@ const expectSelfImportEvidence = (
 const analyzeThroughStdioMcp = async (
   inputPath: string,
 ): Promise<JavaScriptApplicationAnalysisResult> => {
-  const transport = new StdioClientTransport({
-    command: process.execPath,
-    args: [resolve("scripts/rea.mjs"), "mcp"],
-    cwd: process.cwd(),
-    env: {
-      PATH: process.env.PATH ?? "",
-      REA_LOG_LEVEL: "silent",
-    },
-    stderr: "pipe",
+  const client = await connectedMcpClient();
+  const response = await client.callTool({
+    name: "analyze_javascript_application",
+    arguments: { input_path: inputPath },
   });
-  const client = new Client({
-    name: "javascript-self-import-parity",
-    version: "1",
+  expect(response.isError).not.toBe(true);
+  expect(response.content).toEqual(
+    expect.arrayContaining([expect.objectContaining({ type: "text" })]),
+  );
+  const result = z
+    .object({ normalized_result: javascriptApplicationAnalysisResultSchema })
+    .parse(response.structuredContent).normalized_result;
+  expect(result).toMatchObject({
+    input_path: inputPath,
+    format: "directory",
   });
-  try {
-    await client.connect(transport);
-    const response = await client.callTool({
-      name: "analyze_javascript_application",
-      arguments: { input_path: inputPath },
-    });
-    expect(response.isError).not.toBe(true);
-    expect(response.content).toEqual(
-      expect.arrayContaining([expect.objectContaining({ type: "text" })]),
-    );
-    const result = z
-      .object({ normalized_result: javascriptApplicationAnalysisResultSchema })
-      .parse(response.structuredContent).normalized_result;
-    expect(result).toMatchObject({
-      input_path: inputPath,
-      format: "directory",
-    });
-    return result;
-  } finally {
-    try {
-      await client.close();
-    } finally {
-      await transport.close();
-    }
-  }
+  return result;
 };
+
+const expectCliAnalysisParity = async (
+  root: string,
+  mcp: JavaScriptApplicationAnalysisResult,
+): Promise<void> => {
+  const cli = z
+    .object({ normalized_result: javascriptApplicationAnalysisResultSchema })
+    .parse(
+      await runCli(["analyze-javascript-application", root, "--json"]),
+    ).normalized_result;
+  expect(cli).toEqual(mcp);
+};
+
+describe("Electron alias identity through stdio MCP", () => {
+  it.each([
+    {
+      name: "CommonJS binding chains",
+      cliParity: true,
+      esm: false,
+      main: 'const { BrowserWindow, ipcMain } = require("electron"); const First = BrowserWindow; const Win = First; const ipc = ipcMain;',
+      preload:
+        'const { contextBridge, ipcRenderer } = require("electron"); const First = contextBridge; const bridge = First; const ipc = ipcRenderer;',
+    },
+    {
+      name: "static namespace members",
+      esm: false,
+      main: 'const electron = require("electron"); const copied = electron; copied.unrelated = {}; const Win = copied["BrowserWindow"]; const ipc = copied.ipcMain;',
+      preload:
+        'const electron = require("electron"); const copied = electron; const bridge = copied.contextBridge; const ipc = copied["ipcRenderer"];',
+    },
+    {
+      name: "namespace destructuring",
+      esm: false,
+      main: 'const electron = require("electron"); const { BrowserWindow: Win, ipcMain: ipc } = electron;',
+      preload:
+        'const electron = require("electron"); const { contextBridge: bridge, ipcRenderer: ipc } = electron;',
+    },
+    {
+      name: "unwritten let and var bindings",
+      esm: false,
+      main: 'const { BrowserWindow, ipcMain } = require("electron"); let Win = BrowserWindow; var ipc = ipcMain;',
+      preload:
+        'const { contextBridge, ipcRenderer } = require("electron"); var bridge = contextBridge; let ipc = ipcRenderer;',
+    },
+    {
+      name: "ESM binding aliases",
+      cliParity: true,
+      esm: true,
+      main: 'import { BrowserWindow, ipcMain } from "electron"; const Win = BrowserWindow; const ipc = ipcMain;',
+      preload:
+        'import { contextBridge, ipcRenderer } from "electron"; const bridge = contextBridge; const ipc = ipcRenderer;',
+    },
+  ])(
+    "recovers Electron boundaries through $name (#1656)",
+    async ({ cliParity, main, preload, esm }) => {
+      const root = await createTestTempDirectory("rea-electron-alias-cli-");
+      await Promise.all([
+        writeFile(
+          join(root, "package.json"),
+          JSON.stringify({
+            name: "alias-repro",
+            version: "1.0.0",
+            main: "main.js",
+            type: esm ? "module" : "commonjs",
+          }),
+        ),
+        writeFile(
+          join(root, "main.js"),
+          `${main}\n${esm ? 'import { fileURLToPath } from "node:url";' : 'const path = require("node:path");'}\nnew Win({ webPreferences: { preload: ${esm ? 'fileURLToPath(new URL("./preload.js", import.meta.url))' : 'path.join(__dirname, "preload.js")'} } });\nipc.handle("ch:ping", async () => "pong");\nfunction shadow(Win, ipc) { new Win(); ipc.handle("ch:decoy", () => null); }\n`,
+        ),
+        writeFile(
+          join(root, "preload.js"),
+          `${preload}\nbridge.exposeInMainWorld("api", { ping: () => ipc.invoke("ch:ping") });\nfunction shadow(bridge, ipc) { bridge.exposeInMainWorld("decoy", {}); ipc.invoke("ch:decoy"); }\n`,
+        ),
+      ]);
+      const result = await analyzeThroughStdioMcp(root);
+      // Keep CLI parity for both module formats; the other rows vary only AST
+      // semantics already exercised by the same public analysis workflow.
+      if (cliParity) await expectCliAnalysisParity(root, result);
+      expect(result.summary).toMatchObject({
+        browser_windows: 1,
+        explicit_web_preferences: 1,
+        preload_entrypoints: 1,
+        context_bridge_apis: 1,
+        exposed_api_members: 1,
+        ipc: {
+          operations: 2,
+          literal_channels: 1,
+          main_handlers: 1,
+          renderer_transmissions: 1,
+          paired_renderer_transmissions: 1,
+        },
+      });
+      expect(result.limitations).toContain(ELECTRON_IDENTITY_LIMITATION);
+      expect(result.graph.nodes).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            kind: "ipc-channel",
+            observations: expect.arrayContaining([
+              expect.objectContaining({
+                properties: expect.objectContaining({
+                  channel: "ch:ping",
+                  operation: "handle",
+                }),
+                evidence: expect.objectContaining({
+                  authority: "ast-static-analysis",
+                  location: expect.objectContaining({
+                    available: true,
+                    value: expect.objectContaining({
+                      kind: "source-range",
+                      source: "main.js",
+                    }),
+                  }),
+                }),
+              }),
+              expect.objectContaining({
+                properties: expect.objectContaining({
+                  channel: "ch:ping",
+                  operation: "invoke",
+                }),
+                evidence: expect.objectContaining({
+                  authority: "ast-static-analysis",
+                  location: expect.objectContaining({
+                    available: true,
+                    value: expect.objectContaining({
+                      kind: "source-range",
+                      source: "preload.js",
+                    }),
+                  }),
+                }),
+              }),
+            ]),
+          }),
+        ]),
+      );
+      expect(result.graph.edges).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ relation: "handles" }),
+          expect.objectContaining({ relation: "invokes" }),
+          expect.objectContaining({ relation: "loads" }),
+          expect.objectContaining({ relation: "exposes" }),
+        ]),
+      );
+    },
+  );
+});
+
+describe("Electron unavailable identity through stdio MCP", () => {
+  it.each([
+    {
+      name: "reassigned aliases",
+      cliParity: true,
+      main: 'const { BrowserWindow, ipcMain } = require("electron"); let Win = BrowserWindow; let ipc = ipcMain; Win = class {}; ipc = { handle() {} };',
+      preload:
+        'const { contextBridge, ipcRenderer } = require("electron"); let bridge = contextBridge; let ipc = ipcRenderer; bridge = { exposeInMainWorld() {} }; ipc = { invoke() {} };',
+    },
+    {
+      name: "conditional initializers",
+      main: 'const { BrowserWindow, ipcMain } = require("electron"); if (enabled) { var Win = BrowserWindow; var ipc = ipcMain; }',
+      preload:
+        'const { contextBridge, ipcRenderer } = require("electron"); if (enabled) { var bridge = contextBridge; var ipc = ipcRenderer; }',
+    },
+    {
+      name: "dynamic property selections",
+      main: 'const electron = require("electron"); const Win = electron[windowKey]; const ipc = electron[ipcKey];',
+      preload:
+        'const electron = require("electron"); const bridge = electron[bridgeKey]; const ipc = electron[ipcKey];',
+    },
+    {
+      name: "overwritten namespace exports",
+      main: 'const electron = require("electron"); const copied = electron; copied.BrowserWindow = class {}; electron.ipcMain = { handle() {} }; const Win = electron.BrowserWindow; const ipc = copied.ipcMain;',
+      preload:
+        'const electron = require("electron"); electron.contextBridge = { exposeInMainWorld() {} }; electron.ipcRenderer = { invoke() {} }; const bridge = electron.contextBridge; const ipc = electron.ipcRenderer;',
+    },
+    {
+      name: "overwritten API methods",
+      main: 'const electron = require("electron"); const ipc = electron.ipcMain; ipc.handle = () => null; const Win = electron[windowKey];',
+      preload:
+        'const electron = require("electron"); const bridge = electron.contextBridge; delete bridge.exposeInMainWorld; const ipc = electron.ipcRenderer; ipc.invoke++;',
+    },
+    {
+      name: "direct require namespace writes",
+      main: 'require("electron").BrowserWindow = class {}; require("electron").ipcMain = {handle() {}}; const {BrowserWindow: Win, ipcMain: ipc} = require("electron");',
+      preload:
+        'require("electron").contextBridge = {}; require("electron").ipcRenderer = {}; const {contextBridge: bridge, ipcRenderer: ipc} = require("electron");',
+    },
+    {
+      name: "unknown namespace write keys",
+      main: 'const electron = require("electron"); electron[unknownKey] = {}; const {BrowserWindow: Win, ipcMain: ipc} = electron;',
+      preload:
+        'const electron = require("electron"); electron[unknownKey] = {}; const {contextBridge: bridge, ipcRenderer: ipc} = electron;',
+    },
+    {
+      name: "destructuring assignment targets",
+      main: 'const electron = require("electron"); ({ BrowserWindow: electron.BrowserWindow, ipcMain: electron.ipcMain } = replacement); const {BrowserWindow: Win, ipcMain: ipc} = electron;',
+      preload:
+        'const electron = require("electron"); [electron.contextBridge, electron.ipcRenderer] = replacements; const {contextBridge: bridge, ipcRenderer: ipc} = electron;',
+    },
+    {
+      name: "loop assignment targets",
+      main: 'const electron = require("electron"); for ({ BrowserWindow: electron.BrowserWindow, ipcMain: electron.ipcMain } of replacements) {} const {BrowserWindow: Win, ipcMain: ipc} = electron;',
+      preload:
+        'const electron = require("electron"); for (electron.contextBridge in replacements) {} for (electron.ipcRenderer of replacements) {} const {contextBridge: bridge, ipcRenderer: ipc} = electron;',
+    },
+    {
+      name: "literal keys containing dots",
+      main: 'const electron = require("electron"); const Win = electron["fake.BrowserWindow"]; const ipc = electron["fake.ipcMain"]; electron["ipcMain.handle"]("ch:literal", () => null);',
+      preload:
+        'const electron = require("electron"); const bridge = electron["fake.contextBridge"]; const ipc = electron["fake.ipcRenderer"];',
+    },
+  ])(
+    "keeps Electron identity unresolved for $name (#1656)",
+    async ({ cliParity, main, preload }) => {
+      const root = await createTestTempDirectory("rea-electron-alias-unknown-");
+      await Promise.all([
+        writeFile(
+          join(root, "package.json"),
+          JSON.stringify({
+            name: "alias-unknown",
+            version: "1.0.0",
+            main: "main.js",
+          }),
+        ),
+        writeFile(
+          join(root, "main.js"),
+          `${main}\nnew Win(); ipc.handle("ch:ping", () => "pong");\n`,
+        ),
+        writeFile(
+          join(root, "preload.js"),
+          `${preload}\nbridge.exposeInMainWorld("api", { ping: () => ipc.invoke("ch:ping") });\n`,
+        ),
+      ]);
+      const result = await analyzeThroughStdioMcp(root);
+      if (cliParity) await expectCliAnalysisParity(root, result);
+      expect(result.summary).toMatchObject({
+        browser_windows: 0,
+        context_bridge_apis: 0,
+        ipc: { operations: 0 },
+      });
+      expect(
+        result.graph.nodes.some(({ kind }) => kind === "ipc-channel"),
+      ).toBe(false);
+      expect(result.limitations).toContain(ELECTRON_IDENTITY_LIMITATION);
+    },
+  );
+});
+
+it("preserves complete line-comment source-map URLs through CLI and MCP", async () => {
+  const root = await createTestTempDirectory("rea-source-map-url-cli-");
+  const directives = [
+    "//# sourceMappingURL=app.js.map?variant=a*modern",
+    "//@ sourceMappingURL=app.js.map?variant=a*legacy",
+    "//# sourceMappingURL=app.js.map#first*section",
+  ];
+  await writeFile(
+    join(root, "app.js"),
+    ["export const value = 1;", ...directives, ""].join("\n"),
+  );
+  await writeFile(
+    join(root, "app.js.map"),
+    JSON.stringify({ version: 3, sources: [], names: [], mappings: "" }),
+  );
+  const { graph } = z
+    .object({ normalized_result: javascriptApplicationAnalysisResultSchema })
+    .parse(
+      await runCli(["analyze-javascript-application", root, "--json"]),
+    ).normalized_result;
+  const map = graph.nodes.find(
+    ({ kind, observations }) =>
+      kind === "source-map" &&
+      observations.some(({ properties }) => properties.path === "app.js.map"),
+  );
+  const references = map?.observations.filter(
+    ({ label }) => label === "source map reference",
+  );
+  expect(references).toHaveLength(directives.length);
+  for (const [index, directive] of directives.entries()) {
+    const declaredUrl = directive.slice(directive.indexOf("=") + 1);
+    const digest = createHash("sha256").update(declaredUrl).digest("hex");
+    expect(references).toContainEqual(
+      expect.objectContaining({
+        properties: {
+          declared_url: declaredUrl,
+          declared_url_sha256: digest,
+          resolved_path: "app.js.map",
+          resolution_status: "resolved",
+          available: true,
+        },
+        evidence: expect.objectContaining({
+          location: {
+            available: true,
+            value: {
+              kind: "source-range",
+              source: "app.js",
+              start: { line: index + 2, column: 0 },
+              end: { line: index + 2, column: directive.length },
+            },
+          },
+        }),
+      }),
+    );
+    expect(graph.edges).toContainEqual(
+      expect.objectContaining({
+        relation: "maps_to",
+        target_node_id: map?.node_id,
+        properties: {
+          declared_url_sha256: digest,
+          resolved_path: "app.js.map",
+          resolution_status: "resolved",
+        },
+      }),
+    );
+  }
+  expect((await analyzeThroughStdioMcp(root)).graph).toEqual(graph);
+}, 20_000);
+
+it("resolves source-map URL paths once without changing their declarations", async () => {
+  const root = await createTestTempDirectory("rea-source-map-encoding-cli-");
+  const cases = [
+    ["space%20part.js.map", "space part.js.map"],
+    ["literal%25.js.map", "literal%.js.map"],
+    ["encoded%2520.js.map", "encoded%20.js.map"],
+    ["space%20part.js.map?v=1#section", "space part.js.map"],
+    ["caf%C3%A9.js.map", "café.js.map"],
+    ["literal%ZZ.js.map", "literal%ZZ.js.map"],
+  ] as const;
+  for (const path of new Set(cases.map(([, path]) => path))) {
+    await writeFile(
+      join(root, path),
+      JSON.stringify({
+        version: 3,
+        file: path,
+        sources: [],
+        names: [],
+        mappings: "",
+      }),
+    );
+  }
+  await writeFile(
+    join(root, "app.js"),
+    cases.map(([url]) => `//# sourceMappingURL=${url}\n`).join("") +
+      'new Worker(new URL("./worker%20file.js", import.meta.url));\n' +
+      'navigator.serviceWorker.register("./service%20worker.js");\n',
+  );
+  await writeFile(join(root, "worker file.js"), "export const worker = 1;\n");
+  await writeFile(
+    join(root, "service worker.js"),
+    "export const service = 2;\n",
+  );
+  const { graph } = z
+    .object({ normalized_result: javascriptApplicationAnalysisResultSchema })
+    .parse(
+      await runCli(["analyze-javascript-application", root, "--json"]),
+    ).normalized_result;
+  for (const [index, [declaredUrl, path]] of cases.entries()) {
+    const map = graph.nodes.find(
+      ({ kind, observations }) =>
+        kind === "source-map" &&
+        observations.some(({ properties }) => properties.path === path),
+    );
+    const digest = createHash("sha256").update(declaredUrl).digest("hex");
+    expect(map?.observations).toContainEqual(
+      expect.objectContaining({
+        properties: {
+          declared_url: declaredUrl,
+          declared_url_sha256: digest,
+          resolved_path: path,
+          resolution_status: "resolved",
+          available: true,
+        },
+        evidence: expect.objectContaining({
+          location: {
+            available: true,
+            value: {
+              kind: "source-range",
+              source: "app.js",
+              start: { line: index + 1, column: 0 },
+              end: {
+                line: index + 1,
+                column: "//# sourceMappingURL=".length + declaredUrl.length,
+              },
+            },
+          },
+        }),
+      }),
+    );
+    expect(graph.edges).toContainEqual(
+      expect.objectContaining({
+        relation: "maps_to",
+        target_node_id: map?.node_id,
+        properties: {
+          declared_url_sha256: digest,
+          resolved_path: path,
+          resolution_status: "resolved",
+        },
+      }),
+    );
+  }
+  const worker = graph.nodes.find((node) => node.kind === "worker");
+  expect(worker?.observations).toContainEqual(
+    expect.objectContaining({
+      properties: expect.objectContaining({
+        declared_specifier: "./worker%20file.js",
+        resolved_path: "worker file.js",
+      }),
+    }),
+  );
+  expect(graph.edges).toContainEqual(
+    expect.objectContaining({
+      source_node_id: worker?.node_id,
+      relation: "maps_to",
+      properties: { resolved_path: "worker file.js" },
+    }),
+  );
+  // A service worker script URL is relative to the unestablished document base.
+  const serviceWorker = graph.nodes.find(
+    (node) => node.kind === "service-worker",
+  );
+  expect(serviceWorker?.observations).toContainEqual(
+    expect.objectContaining({
+      properties: expect.objectContaining({
+        declared_specifier: null,
+        expression: 'navigator.serviceWorker.register("./service%20worker.js")',
+        resolved_path: null,
+      }),
+    }),
+  );
+  expect(
+    graph.edges.some(
+      ({ source_node_id, relation }) =>
+        source_node_id === serviceWorker?.node_id && relation === "maps_to",
+    ),
+  ).toBe(false);
+  expect((await analyzeThroughStdioMcp(root)).graph).toEqual(graph);
+}, 20_000);
 
 describe("JavaScript application path CLI", () => {
   it("accepts a relative local application path and preserves canonical Evidence identity", async () => {
     const root = await createTestTempDirectory("rea-relative-application-cli-");
-    temporary.push(root);
     await writeFile(join(root, "app.js"), "export const value = 1;\n");
     const absolute = await analyzeJavaScriptApplication({ input_path: root });
     if (!absolute.ok) throw absolute.error;
@@ -232,7 +666,6 @@ describe("JavaScript application path CLI", () => {
     const root = await createTestTempDirectory(
       "rea-self-import-application-cli-",
     );
-    temporary.push(root);
     await writeSelfImportFixture(root);
 
     const analyzed = await runCli([
@@ -254,7 +687,6 @@ describe("JavaScript application path CLI", () => {
 
   it("preserves canonical Electron API aliases through CLI and stdio MCP", async () => {
     const root = await createTestTempDirectory("rea-electron-api-alias-");
-    temporary.push(root);
     await writeElectronApiAliasApplication(root);
 
     const cliResult = z
@@ -338,7 +770,6 @@ describe("application workflow CLI parity", () => {
     });
 
     const root = await createTestTempDirectory("rea-application-cli-");
-    temporary.push(root);
     const comparisonPath = join(root, "comparison.json");
     await writeFile(
       comparisonPath,
@@ -404,7 +835,6 @@ describe("application workflow CLI parity", () => {
 
   it("traces the same authenticated semantic graph through the CLI", async () => {
     const root = await createTestTempDirectory("rea-semantic-cli-");
-    temporary.push(root);
     await writeFile(
       join(root, "app.js"),
       "function add(value) { return value + 1; } add(2);",
@@ -455,19 +885,18 @@ describe("rest parameter semantic trace CLI", () => {
       root,
       "--json",
     ]);
-    const analyzed = await analyzeJavaScriptApplication({ input_path: root });
-    if (!analyzed.ok) throw analyzed.error;
-    const graph = javascriptApplicationAnalysisResultSchema.parse(
-      analyzed.value.normalized_result,
-    ).semantic_graph;
+    const graph = z
+      .object({ normalized_result: javascriptApplicationAnalysisResultSchema })
+      .parse(application).normalized_result.semantic_graph;
     for (const index of [1, 2]) {
       const argument = graph.nodes.find(
         ({ kind, label }) =>
           kind === "expression" && label === `argument ${String(index)}`,
       );
       if (argument === undefined) throw new Error("Missing argument node");
-      const traced = await runCli([
-        "trace-javascript-semantics",
+      const requestPath = join(root, `trace-request-${index}.json`);
+      await writeFile(
+        requestPath,
         JSON.stringify({
           application,
           query: {
@@ -477,6 +906,10 @@ describe("rest parameter semantic trace CLI", () => {
             expected: { role: "sink", classes: ["parameter"] },
           },
         }),
+      );
+      const traced = await runCli([
+        "trace-javascript-semantics",
+        requestPath,
         "--json",
       ]);
       expect(traced).toMatchObject({
@@ -527,7 +960,6 @@ describe("empty property key application CLI", () => {
 describe("Webpack factory CommonJS export keys", () => {
   it("keeps exact static keys and omits computed names through CLI and MCP", async () => {
     const root = await createTestTempDirectory("rea-webpack-export-keys-");
-    temporary.push(root);
     const bundle = `globalThis.webpackChunkStaticExports.push([["main"], {
       1: function(module, exports, __webpack_require__) {${WEBPACK_FACTORY_BODY}},
       2: function(module) { module.exports = function realDefault() {}; },
@@ -548,7 +980,6 @@ describe("Webpack factory CommonJS export keys", () => {
     const oracleRoot = await createTestTempDirectory(
       "rea-webpack-export-oracle-",
     );
-    temporary.push(oracleRoot);
     const oraclePath = join(oracleRoot, "oracle.cjs");
     await writeFile(oraclePath, WEBPACK_FACTORY_BODY);
     const actual = requireFixture(oraclePath) as Record<string, unknown>;
@@ -614,32 +1045,16 @@ describe("Webpack factory CommonJS export keys", () => {
         "--json",
       ]),
     );
-    const transport = new StdioClientTransport({
-      command: process.execPath,
-      args: [resolve("scripts/rea.mjs"), "mcp"],
-      cwd: process.cwd(),
-      env: { PATH: process.env.PATH ?? "", REA_LOG_LEVEL: "silent" },
-      stderr: "pipe",
+    const client = await connectedMcpClient();
+    const response = await client.callTool({
+      name: "analyze_javascript_application",
+      arguments: { input_path: root, format: "directory" },
     });
-    transport.stderr?.on("data", () => undefined);
-    const client = new Client({ name: "webpack-export-keys", version: "1" });
-    let mcpEvidence: z.infer<typeof applicationEvidenceSchema>;
-    try {
-      await client.connect(transport);
-      const response = await client.callTool({
-        name: "analyze_javascript_application",
-        arguments: { input_path: root, format: "directory" },
-      });
-      expect(response.isError).not.toBe(true);
-      mcpEvidence = applicationEvidenceSchema.parse(response.structuredContent);
-      expect(await client.ping()).toEqual({});
-    } finally {
-      try {
-        await client.close();
-      } finally {
-        await transport.close();
-      }
-    }
+    expect(response.isError).not.toBe(true);
+    const mcpEvidence = applicationEvidenceSchema.parse(
+      response.structuredContent,
+    );
+    expect(await client.ping()).toEqual({});
     expect(mcpEvidence.evidence_id).toBe(cliEvidence.evidence_id);
 
     const expectBundleExports = (
@@ -697,7 +1112,6 @@ describe("application workflow CLI input", () => {
 describe("application workflow CLI copy boundaries", () => {
   it("compares source values excluded from escaped rest and spread copies", async () => {
     const root = await createTestTempDirectory("rea-copy-boundary-cli-");
-    temporary.push(root);
     const sources = [
       `export default function make() {
         function mutate(value) { value.changed = true; }
@@ -729,7 +1143,7 @@ describe("application workflow CLI copy boundaries", () => {
         };
       }`,
     ];
-    const [left, right] = await analyzeCliSources(root, sources);
+    const [left, right] = await analyzeComparisonSources(root, sources);
     const inputPath = join(root, "comparison.json");
     await writeFile(
       inputPath,
@@ -770,7 +1184,6 @@ describe("application workflow CLI copy boundaries", () => {
 describe("application workflow CLI and MCP capture lifetimes", () => {
   it("compares captured primitives and source values after aliases are replaced", async () => {
     const root = await createTestTempDirectory("rea-capture-lifetime-cli-");
-    temporary.push(root);
     const fields = [
       "rebound",
       "rest",
@@ -822,7 +1235,12 @@ describe("application workflow CLI and MCP capture lifetimes", () => {
         ...Object.fromEntries(fields.map((field) => [field, "UPDATED"])),
       })}; }`,
     ];
-    const [left, right] = await analyzeCliSources(root, sources);
+    // Retain a complete CLI analysis-to-comparison journey alongside MCP parity.
+    const [left, right] = await Promise.all(
+      (await writeComparisonSources(root, sources)).map((applicationRoot) =>
+        runCli(["analyze-javascript-application", applicationRoot, "--json"]),
+      ),
+    );
     // Execute the authored fixtures independently of static analysis.
     for (const [index, value] of ["TOKEN", "UPDATED"].entries()) {
       const { stdout } = await execute(process.execPath, [
@@ -872,7 +1290,6 @@ describe("application workflow CLI and MCP capture lifetimes", () => {
 describe("application workflow CLI export Evidence", () => {
   it("preserves uncertainty after a helper can mutate an awaited return object", async () => {
     const root = await createTestTempDirectory("rea-awaited-export-shape-cli-");
-    temporary.push(root);
     const sources = [
       `export default async function make() {
         const result = { kind: "record" };
@@ -882,7 +1299,7 @@ describe("application workflow CLI export Evidence", () => {
       }`,
       'export default async function make() { return { kind: "record", extra: 1 }; }',
     ];
-    const [left, right] = await analyzeCliSources(root, sources);
+    const [left, right] = await analyzeComparisonSources(root, sources);
     const compared = await runCli([
       "compare-javascript-export-shapes",
       JSON.stringify({
@@ -909,7 +1326,6 @@ describe("application workflow CLI export Evidence", () => {
 
   it("compares exact export shapes from file-backed Evidence", async () => {
     const root = await createTestTempDirectory("rea-export-shape-cli-");
-    temporary.push(root);
     const leftRoot = join(root, "left");
     const rightRoot = join(root, "right");
     await Promise.all([mkdir(leftRoot), mkdir(rightRoot)]);
@@ -973,7 +1389,6 @@ describe("application workflow CLI export property presence", () => {
     const root = await createTestTempDirectory(
       "rea-export-shape-presence-cli-",
     );
-    temporary.push(root);
     const leftRoot = join(root, "left");
     const rightRoot = join(root, "right");
     await Promise.all([mkdir(leftRoot), mkdir(rightRoot)]);
@@ -1099,50 +1514,105 @@ describe("application workflow CLI validation", () => {
 const compareThroughStdioMcp = async (
   input: Record<string, unknown>,
 ): Promise<unknown> => {
-  const transport = new StdioClientTransport({
-    command: process.execPath,
-    args: [resolve("scripts/rea.mjs"), "mcp"],
-    cwd: process.cwd(),
-    env: { PATH: process.env.PATH ?? "", REA_LOG_LEVEL: "silent" },
-    stderr: "pipe",
+  const client = await connectedMcpClient();
+  const response = await client.callTool({
+    name: "compare_javascript_export_shapes",
+    arguments: input,
   });
-  const client = new Client({
-    name: "javascript-capture-parity",
-    version: "1",
-  });
-  try {
-    await client.connect(transport);
-    const response = await client.callTool({
-      name: "compare_javascript_export_shapes",
-      arguments: input,
-    });
-    expect(response.isError).not.toBe(true);
-    return response.structuredContent;
-  } finally {
-    try {
-      await client.close();
-    } finally {
-      await transport.close();
-    }
-  }
+  expect(response.isError).not.toBe(true);
+  return response.structuredContent;
 };
 
-const analyzeCliSources = (
+const writeComparisonSources = (
   root: string,
   sources: readonly string[],
-): Promise<unknown[]> =>
+): Promise<string[]> =>
   Promise.all(
     sources.map(async (source, index) => {
       const applicationRoot = join(root, String(index));
       await mkdir(applicationRoot);
       await writeFile(join(applicationRoot, "parser.mjs"), source);
-      return runCli([
-        "analyze-javascript-application",
-        applicationRoot,
-        "--json",
-      ]);
+      return applicationRoot;
     }),
   );
+
+// Produce comparison inputs through the shared stateless stdio workflow;
+// each consumer still executes the real CLI with its own authored sources.
+const analyzeComparisonSources = async (
+  root: string,
+  sources: readonly string[],
+): Promise<unknown[]> => {
+  const client = await connectedMcpClient();
+  return Promise.all(
+    (await writeComparisonSources(root, sources)).map(
+      async (applicationRoot) => {
+        const response = await client.callTool({
+          name: "analyze_javascript_application",
+          arguments: { input_path: applicationRoot },
+        });
+        expect(response.isError).not.toBe(true);
+        return response.structuredContent;
+      },
+    ),
+  );
+};
+
+it("retains bundled isolated-world contextBridge APIs through dedicated and generic CLI routes", async () => {
+  const root = await createTestTempDirectory(
+    "rea-context-bridge-isolated-cli-",
+  );
+  await writeFile(
+    join(root, "preload.js"),
+    `(() => {
+      const modules = {
+        2(module) { module.exports = require("electron"); },
+        5(module, exports, load) {
+          const electron = load(2);
+          electron.contextBridge.exposeInIsolatedWorld(1001, "isolatedApi", { ping: true });
+        },
+      };
+      function load(id) {
+        const module = { exports: {} };
+        modules[id].call(module.exports, module, module.exports, load);
+        return module.exports;
+      }
+      load(5);
+    })();`,
+  );
+
+  for (const arguments_ of [
+    ["analyze-javascript-application", root, "--json"],
+    ["analyze", root, "--format", "json"],
+  ]) {
+    const result = javascriptApplicationAnalysisResultSchema.parse(
+      parseEvidence(await runCli(arguments_)).normalized_result,
+    );
+    expect(result.summary.context_bridge_apis).toBe(1);
+    const bridge = result.graph.nodes.find(
+      ({ kind }) => kind === "context-bridge-api",
+    );
+    expect(bridge?.observations).toContainEqual(
+      expect.objectContaining({
+        properties: expect.objectContaining({
+          world: "isolated",
+          world_id: { status: "literal", value: 1001, expression: null },
+          api_key: "isolatedApi",
+          api_status: "object-literal",
+          members: ["ping"],
+          unknown_members: 0,
+          // The proven Webpack bootstrap resolves `load(2)` directly.
+          resolution_basis: "direct-syntax",
+        }),
+        evidence: expect.objectContaining({
+          location: expect.objectContaining({
+            available: true,
+            value: expect.objectContaining({ source: "preload.js" }),
+          }),
+        }),
+      }),
+    );
+  }
+});
 
 const runCli = async (
   arguments_: readonly string[],

@@ -1,6 +1,10 @@
 import type { ArtifactInventorySnapshot } from "../../domain/artifactInventorySnapshot.js";
 import type { ApplicationNode } from "../../domain/javascript/javascriptApplicationGraphSchemas.js";
-import { completeApplicationCoverage } from "../../domain/javascript/javascriptApplicationEvidenceSchemas.js";
+import { htmlInlineScriptLimitation } from "./JavaScriptArtifactAnalysis.js";
+import {
+  completeApplicationCoverage,
+  partialApplicationCoverage,
+} from "../../domain/javascript/javascriptApplicationEvidenceSchemas.js";
 import type { JavaScriptModuleArtifactAnalysis } from "./JavaScriptArtifactAnalysisTypes.js";
 import { jsonValueSchema } from "../../domain/jsonValue.js";
 import { freezeJsonSnapshot } from "../../domain/immutableJson.js";
@@ -17,6 +21,8 @@ import {
   artifactLocalIdentity,
   javascriptAnalysisCoverage,
   createElectronRoleNode,
+  HTML_INLINE_SCRIPT_LOCATION_COVERAGE_LIMIT,
+  omittedHtmlInlineScriptLocations,
   linkElectronRoleToAsset,
   type JavaScriptArtifactGraphContext,
 } from "./JavaScriptArtifactGraphContext.js";
@@ -25,7 +31,11 @@ import {
   astObservationEvidence,
   staticInferenceEvidence,
 } from "./JavaScriptArtifactGraphEvidence.js";
-import { resolveArtifactPathByContext } from "./JavaScriptArtifactPathResolution.js";
+import {
+  artifactPathResolutionProperties,
+  resolveArtifactPathByContext,
+} from "./JavaScriptArtifactPathResolution.js";
+import { compareUnicodeCodePoints } from "../../domain/unicodeCodePointOrder.js";
 
 interface PackageRoleInput {
   readonly packageNode: ApplicationNode;
@@ -123,6 +133,9 @@ export const addJavaScriptArtifactFiles = (
   const packagesByPath = indexFirstByPath(context.analysis.packages);
   const jsonModulesByPath = indexFirstByPath(context.analysis.json_modules);
   const sourceMapsByPath = indexFirstByPath(context.analysis.source_maps);
+  const inlineScriptsByPath = indexFirstByPath(
+    context.analysis.html_inline_scripts,
+  );
   for (const analyzed of context.analysis.files) {
     const { file } = analyzed;
     const jsonValue = jsonModulesByPath.get(file.path);
@@ -198,7 +211,15 @@ export const addJavaScriptArtifactFiles = (
         }),
       });
     }
-    if (analyzed.analysis_failure !== undefined)
+    if (!file.text.included && file.text.reason === "outside-analysis-scope")
+      addUnavailableStaticParseScope(context, {
+        file,
+        asset: target,
+        operation: "select-javascript-sources",
+        limitation:
+          "Source is outside the caller-selected source_paths; it was inventoried but not analyzed.",
+      });
+    else if (analyzed.analysis_failure !== undefined)
       addUnavailableStaticParseScope(context, {
         file,
         asset: target,
@@ -256,8 +277,158 @@ export const addJavaScriptArtifactFiles = (
         operation: "parse-local-source-map",
         limitation: sourceMap.limitation,
       });
+    const inlineScripts = inlineScriptsByPath.get(file.path);
+    if (inlineScripts !== undefined)
+      addUnavailableStaticParseScope(context, {
+        file,
+        asset: target,
+        operation: "parse-html-inline-scripts",
+        limitation: htmlInlineScriptLimitation(inlineScripts),
+        limits:
+          inlineScripts.script_count > inlineScripts.scripts.length
+            ? [HTML_INLINE_SCRIPT_LOCATION_COVERAGE_LIMIT]
+            : [],
+        omittedCount: omittedHtmlInlineScriptLocations([inlineScripts]),
+        details: {
+          inline_script_count: inlineScripts.script_count,
+          inline_scripts: inlineScripts.scripts.map(
+            ({ script_type, location }) => ({
+              script_type,
+              location: {
+                start: { ...location.start },
+                end: { ...location.end },
+              },
+            }),
+          ),
+        },
+      });
+  }
+  addUnavailableAsarEntries(context);
+};
+
+const addUnavailableAsarEntries = (
+  context: JavaScriptArtifactGraphContext,
+): void => {
+  for (const file of context.fileSet.unavailable_relevant_files) {
+    if (!isAsarContainer(context, file.container_sha256)) continue;
+    const limitations = [
+      ...(file.limitations ?? []),
+      `The inventoried ${file.kind ?? "relevant"} entry has unavailable bytes; no content artifact identity can be established.`,
+    ];
+    const entry = context.accumulator.addNode({
+      kind: "asar-entry",
+      identity: {
+        strategy: "canonical-path",
+        stability: "artifact-version",
+        artifact_sha256: file.container_sha256,
+        path: file.path,
+      },
+      observations: [
+        {
+          label: file.path,
+          properties: {
+            entry_sha256: file.sha256,
+            bytes: file.bytes,
+            inventory_artifact_id: file.inventory_artifact_id,
+            ...(file.inventory_occurrence_id === undefined
+              ? {}
+              : { inventory_occurrence_id: file.inventory_occurrence_id }),
+            hash_status: file.hash_status,
+            artifact_kind: file.artifact_kind,
+            ...(file.kind === undefined ? {} : { kind: file.kind }),
+            content_available: false,
+          },
+          evidence: artifactObservationEvidence({
+            sha256: file.container_sha256,
+            path: file.path,
+            operation: "inventory-asar-unavailable-entry",
+            coverage: partialApplicationCoverage([], null),
+            limitations,
+          }),
+        },
+      ],
+    });
+    const parent =
+      context.containerNodes.get(file.container_sha256) ?? context.root;
+    context.accumulator.addEdge({
+      source_node_id: parent.node_id,
+      target_node_id: entry.node_id,
+      relation: "contains",
+      properties: {
+        path: file.path,
+        content_available: false,
+        hash_status: file.hash_status,
+      },
+      evidence: artifactObservationEvidence({
+        sha256: file.container_sha256,
+        path: file.path,
+        operation: "inventory-asar-unavailable-entry",
+        coverage: partialApplicationCoverage([], null),
+        limitations,
+      }),
+    });
+    if (file.kind === "native-addon" || file.artifact_kind === "native-addon") {
+      const addon = context.accumulator.addNode({
+        kind: "native-addon",
+        identity: {
+          strategy: "canonical-path",
+          stability: "artifact-version",
+          artifact_sha256: file.container_sha256,
+          path: file.path,
+        },
+        observations: [
+          {
+            label: file.path,
+            properties: {
+              availability: "unavailable",
+              ...(file.hash_status === undefined
+                ? {}
+                : { hash_status: file.hash_status }),
+              ...(file.artifact_kind === undefined
+                ? {}
+                : { artifact_kind: file.artifact_kind }),
+              bytes: file.bytes,
+              inventory_artifact_id: file.inventory_artifact_id,
+              ...(file.inventory_occurrence_id === undefined
+                ? {}
+                : { inventory_occurrence_id: file.inventory_occurrence_id }),
+            },
+            evidence: artifactObservationEvidence({
+              sha256: file.container_sha256,
+              path: file.path,
+              operation: "classify-unavailable-native-addon",
+              coverage: partialApplicationCoverage([], null),
+              limitations,
+            }),
+          },
+        ],
+      });
+      context.accumulator.addEdge({
+        source_node_id: entry.node_id,
+        target_node_id: addon.node_id,
+        relation: "contains",
+        properties: {
+          classification: "native-addon",
+          content_available: false,
+        },
+        evidence: artifactObservationEvidence({
+          sha256: file.container_sha256,
+          path: file.path,
+          operation: "classify-unavailable-native-addon",
+          coverage: partialApplicationCoverage([], null),
+          limitations,
+        }),
+      });
+    }
   }
 };
+
+const isAsarContainer = (
+  context: JavaScriptArtifactGraphContext,
+  containerSha256: string,
+): boolean =>
+  context.snapshot.manifest.root_format === "asar" ||
+  containerSha256 !== context.snapshot.manifest.root_sha256;
 
 const sourceFileRange = (
   file: JavaScriptArtifactFile,
@@ -281,6 +452,7 @@ export const addJavaScriptPackageNodes = (
   context: JavaScriptArtifactGraphContext,
 ): ApplicationNode[] => {
   const roots: ApplicationNode[] = [];
+  const rootPath = applicationManifestPath(context);
   for (const packageValue of context.analysis.packages) {
     const file = context.filesByPath.get(packageValue.path);
     if (file === undefined) continue;
@@ -309,7 +481,7 @@ export const addJavaScriptPackageNodes = (
         },
       ],
     });
-    if (roots.length === 0) {
+    if (file.path === rootPath) {
       roots.push(node);
       context.accumulator.addEdge({
         source_node_id: node.node_id,
@@ -330,6 +502,7 @@ export const addJavaScriptPackageNodes = (
         file,
         operation: "inventory-package",
       });
+    if (dependencyManifest(file.path)) continue;
     addPackageRole(context, {
       packageNode: node,
       packageFile: file,
@@ -345,6 +518,24 @@ export const addJavaScriptPackageNodes = (
   }
   return roots;
 };
+
+/** Dependency-only artifacts retain their inventory root. */
+const applicationManifestPath = (
+  context: JavaScriptArtifactGraphContext,
+): string | undefined =>
+  context.analysis.packages
+    .map(({ path }) => path)
+    .filter(
+      (path) => context.filesByPath.has(path) && !dependencyManifest(path),
+    )
+    .sort(
+      (left, right) =>
+        left.split("/").length - right.split("/").length ||
+        compareUnicodeCodePoints(left, right),
+    )[0];
+
+const dependencyManifest = (path: string): boolean =>
+  path.split("/").slice(0, -1).includes("node_modules");
 
 const createFileTarget = (
   context: JavaScriptArtifactGraphContext,
@@ -401,10 +592,7 @@ const createAsarEntry = (
   context: JavaScriptArtifactGraphContext,
   file: JavaScriptArtifactFile,
 ): ApplicationNode | undefined => {
-  const isAsar =
-    context.snapshot.manifest.root_format === "asar" ||
-    file.container_sha256 !== context.snapshot.manifest.root_sha256;
-  if (!isAsar) return undefined;
+  if (!isAsarContainer(context, file.container_sha256)) return undefined;
   return context.accumulator.addNode({
     kind: "asar-entry",
     identity: {
@@ -443,6 +631,8 @@ const addPackageRole = (
     sourcePath: input.packageFile.path,
     context: "package-entrypoint",
     files: context.filesByPath,
+    directoryPaths: context.directoryPaths,
+    unanalyzedFiles: context.unanalyzedFiles,
   });
   const role = createElectronRoleNode(context, {
     kind: input.kind,
@@ -462,6 +652,7 @@ const addPackageRole = (
       resolution_context: resolution.resolution_context,
       resolved_path: resolution.resolved_path,
       resolution_status: resolution.resolution_status,
+      ...artifactPathResolutionProperties(resolution),
       limitations: resolution.limitations,
     },
     evidence: staticInferenceEvidence({

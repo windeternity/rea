@@ -23,7 +23,6 @@ export const decodeObjcCategories = (input: {
   readonly sections: readonly Section[];
   readonly read: ObjcDispatchReaders;
   readonly result: ObjcSwiftMetadata;
-  readonly failures: string[];
   readonly issues: DecodeIssue[];
   readonly admit: () => boolean;
   /** Decode a method list into implementations attributed to the category. */
@@ -37,7 +36,7 @@ export const decodeObjcCategories = (input: {
   /** Name of a class defined in this image, from its class_ro_t. */
   readonly localClassName: (address: bigint) => string;
 }): number => {
-  const { read, result, failures } = input;
+  const { read, result } = input;
   let examined = 0;
   for (const section of input.sections.filter(
     ({ name }) => name === "__objc_catlist",
@@ -53,8 +52,22 @@ export const decodeObjcCategories = (input: {
         const name = read.string(read.pointer(category));
         const external = boundClassName(read, category + 8n);
         const local = read.pointer(category + 8n);
-        const className =
-          external ?? (local === 0n ? null : input.localClassName(local));
+        let className = external ?? null;
+        if (external === undefined && local !== 0n)
+          try {
+            className = input.localClassName(local);
+          } catch (cause: unknown) {
+            // The category's own name and methods do not depend on its owner;
+            // keep them and report the unreadable class reference.
+            input.issues.push(
+              issue(
+                "objc_properties_categories",
+                "category_class_unresolved",
+                `Category ${name} class reference 0x${local.toString(16)}: ${cause instanceof Error ? cause.message : String(cause)}`,
+                `0x${(category + 8n).toString(16)}`,
+              ),
+            );
+          }
         const owner = className ?? `(${name})`;
         result.objc_categories.push({
           name,
@@ -93,7 +106,6 @@ export const decodeObjcCategories = (input: {
         });
       } catch (cause: unknown) {
         const message = cause instanceof Error ? cause.message : String(cause);
-        failures.push(`Category at 0x${field.toString(16)}: ${message}`);
         input.issues.push(
           issue(
             "objc_properties_categories",

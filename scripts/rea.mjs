@@ -5,7 +5,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 // Route production MCP before importing Incur. Incur owns registration helpers
-// such as `mcp add`, while only dist/main.js may serve the stdio tool catalog.
+// such as `mcp add`, while the MCP runtime serves the stdio tool catalog.
 const args = process.argv.slice(2);
 const { default: packageJson } = await import("../package.json", {
   with: { type: "json" },
@@ -14,7 +14,17 @@ process.env.REA_PACKAGE_VERSION = packageJson.version;
 const isMcpMode =
   args.length === 1 && (args[0] === "--mcp" || args[0] === "mcp");
 const isMcpDoctorMode = args[0] === "mcp" && args[1] === "doctor";
+/** Exit status of a writer terminated by SIGPIPE (128 + 13). */
+const SIGPIPE_EXIT_STATUS = 141;
+// Set once the reader of CLI output has closed the pipe.
+let stdoutClosed = false;
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+
+// Windows home lookup throws for an empty USERPROFILE. Dependencies resolve
+// home during import, before REA's own resolver can apply its account fallback.
+if (process.platform === "win32" && process.env.USERPROFILE === "") {
+  delete process.env.USERPROFILE;
+}
 
 // Playwright's registry assumes one of its three desktop host platforms when
 // it chooses the browser cache directory. Termux reports `android`, although
@@ -31,10 +41,14 @@ if (
 }
 
 const runtimeFiles = isMcpMode
-  ? ["dist/main.js"]
+  ? ["dist/mcp/main.js"]
   : isMcpDoctorMode
-    ? ["dist/main.js", "dist/mcpDoctor.js"]
-    : ["dist/cli.js", "dist/cliOutput.js", "dist/cli/streamedJsonOutput.js"];
+    ? ["dist/mcp/main.js", "dist/cli-runtime/mcpDoctor.js"]
+    : [
+        "dist/cli-runtime/cli.js",
+        "dist/cli-runtime/cliOutput.js",
+        "dist/cli-runtime/cliResultOutput.js",
+      ];
 
 if (!(await compiledRuntimeExists(runtimeFiles))) {
   process.stderr.write(
@@ -42,45 +56,80 @@ if (!(await compiledRuntimeExists(runtimeFiles))) {
   );
   process.exitCode = 1;
 } else if (isMcpMode) {
-  const { runEntrypoint } = await import("../dist/main.js");
+  const { runEntrypoint } = await import("../dist/mcp/main.js");
   await runEntrypoint();
 } else if (isMcpDoctorMode) {
-  const { runProductionMcpDoctorCli } = await import("../dist/mcpDoctor.js");
+  guardClosedStdout();
+  const { runProductionMcpDoctorCli } =
+    await import("../dist/cli-runtime/mcpDoctor.js");
   const result = await runProductionMcpDoctorCli(args.slice(2), {
     dispatcherPath: fileURLToPath(import.meta.url),
     packageRoot,
   });
-  process.stdout.write(result.output);
+  writeStdout(result.output);
   process.exitCode = result.exitCode;
 } else {
-  const { createCli } = await import("../dist/cli.js");
-  const { createStreamedCliJsonOutput } =
-    await import("../dist/cli/streamedJsonOutput.js");
+  const { cliConfigurationError, createCli } =
+    await import("../dist/cli-runtime/cli.js");
+  const { createCliResultOutput } =
+    await import("../dist/cli-runtime/cliResultOutput.js");
   const {
+    normalizeCliOutputArguments,
     renderCliOutputArgumentError,
     renderEmptyFilteredCliOutput,
     validateCliOutputArguments,
-  } = await import("../dist/cliOutput.js");
-  const outputArguments = validateCliOutputArguments(args);
-  if (!outputArguments.ok) {
-    process.stdout.write(renderCliOutputArgumentError(outputArguments));
+  } = await import("../dist/cli-runtime/cliOutput.js");
+  guardClosedStdout();
+  const cliArgs = normalizeCliOutputArguments(args);
+  const outputArguments = validateCliOutputArguments(cliArgs);
+  const configurationError = cliConfigurationError(process.env);
+  if (configurationError !== undefined) {
+    process.stderr.write(`${configurationError}\n`);
+    process.exitCode = 1;
+  } else if (!outputArguments.ok) {
+    writeStdout(renderCliOutputArgumentError(outputArguments));
     process.exitCode = 1;
   } else {
     let wroteOutput = false;
-    const resultOutput = createStreamedCliJsonOutput(args, process.stdout);
-    await createCli(process.env, resultOutput).serve(args, {
+    const resultOutput = createCliResultOutput(cliArgs, process.stdout);
+    await createCli(process.env, resultOutput).serve(cliArgs, {
       stdout: (output) => {
         if (resultOutput?.handled) {
-          if (resultOutput.failed) process.stderr.write(output);
+          if (resultOutput.failed && !stdoutClosed)
+            process.stderr.write(output);
           return;
         }
         if (output.length > 0) wroteOutput = true;
-        process.stdout.write(output);
+        writeStdout(output);
       },
+      // A command failure caused by the closed pipe keeps the pipe's status.
+      exit: (code) => process.exit(stdoutClosed ? SIGPIPE_EXIT_STATUS : code),
     });
     if (!wroteOutput && !resultOutput?.handled)
-      process.stdout.write(renderEmptyFilteredCliOutput(args) ?? "");
+      writeStdout(renderEmptyFilteredCliOutput(cliArgs) ?? "");
   }
+}
+
+/**
+ * A reader that closes the pipe early, as `rea ... | head` does, has declined
+ * the rest of the output. Stop writing without reporting a failure, and exit
+ * with the status a SIGPIPE-terminated writer reports. MCP stdio keeps its own
+ * client lifecycle.
+ */
+function guardClosedStdout() {
+  process.stdout.on("error", (cause) => {
+    if (cause?.code === "EPIPE") {
+      stdoutClosed = true;
+      process.exitCode = SIGPIPE_EXIT_STATUS;
+      return;
+    }
+    // Other failures stay unhandled unless a pending JSON write reports them.
+    if (process.stdout.listenerCount("error") === 1) throw cause;
+  });
+}
+
+function writeStdout(output) {
+  if (!stdoutClosed) process.stdout.write(output);
 }
 
 async function compiledRuntimeExists(paths) {

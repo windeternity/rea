@@ -1,9 +1,11 @@
 import { z } from "zod";
-import type { JebAnalysisPort } from "../application/jeb/JebAnalysisPort.js";
+import type {
+  JebAnalysisPort,
+  JebAnalysisAvailability,
+} from "../application/jeb/JebAnalysisPort.js";
 import type {
   AnalysisExecution,
   ExecutionOptions,
-  ProviderAvailability,
   ProviderIdentity,
 } from "../application/AnalysisProvider.js";
 import { createAnalysisExecution } from "../application/AnalysisProvider.js";
@@ -23,6 +25,7 @@ import {
 } from "./JebMcpEndpoint.js";
 import {
   createStreamableHttpJebMcpConnection,
+  JEB_ENGINE_TOOLS,
   type JebMcpConnection,
   type JebMcpConnectionFactory,
 } from "./JebMcpConnection.js";
@@ -36,6 +39,8 @@ export const JEB_PROVIDER_IDENTITY: ProviderIdentity = {
 export interface JebProviderOptions {
   /** Caller environment carrying REA_JEB_MCP_URL. */
   readonly environment?: Readonly<Record<string, string | undefined>>;
+  /** Per-tools/call budget selected by REA_JEB_MCP_TIMEOUT_MS. */
+  readonly requestTimeoutMs?: number;
   /** Injectable MCP boundary; defaults to the streamable HTTP client. */
   readonly connectionFactory?: JebMcpConnectionFactory;
 }
@@ -69,16 +74,14 @@ const openProject = z
     success: z.literal(true),
     name: z.string().nullish(),
     creation_datetime: z.string().nullish(),
-    input_files: z
-      .array(
-        z.object({
-          file_name: z.string(),
-          file_size: z.number().int().nonnegative(),
-          contents_sha256_hash: z.string(),
-        }),
-      )
-      .optional(),
-    units: z.array(unitEntry).optional(),
+    input_files: z.array(
+      z.object({
+        file_name: z.string(),
+        file_size: z.number().int().nonnegative(),
+        contents_sha256_hash: z.string(),
+      }),
+    ),
+    units: z.array(unitEntry),
   })
   .passthrough();
 const listUnits = z
@@ -110,21 +113,29 @@ export class JebProvider implements JebAnalysisPort {
     const endpoint = parseJebMcpEndpoint(environment.REA_JEB_MCP_URL);
     if (!endpoint.ok) throw endpoint.error;
     this.#endpoint = endpoint.value;
-    this.#connection = (
-      options.connectionFactory ??
-      ((url: URL) => createStreamableHttpJebMcpConnection(url))
-    )(this.#endpoint);
+    const createConnection =
+      options.connectionFactory ?? createStreamableHttpJebMcpConnection;
+    this.#connection =
+      options.requestTimeoutMs === undefined
+        ? createConnection(this.#endpoint)
+        : createConnection(this.#endpoint, {
+            requestTimeoutMs: options.requestTimeoutMs,
+          });
   }
 
   async inspectAvailability(
     signal?: AbortSignal,
-  ): Promise<ProviderAvailability> {
+  ): Promise<JebAnalysisAvailability> {
     try {
+      const tools = new Set(await this.#connection.listTools(signal));
       await this.#refreshClientInformation(signal);
       return {
         status: "available",
         code: null,
         reason: null,
+        supportedOperations: (
+          Object.keys(JEB_ENGINE_TOOLS) as JebOperation[]
+        ).filter((operation) => tools.has(JEB_ENGINE_TOOLS[operation])),
         diagnostics: {
           endpoint: this.#endpoint.toString(),
           engine_version: this.#identity.version,
@@ -292,8 +303,8 @@ export class JebProvider implements JebAnalysisPort {
       engine,
       project_name: opened.name ?? null,
       creation_datetime: opened.creation_datetime ?? null,
-      input_files: opened.input_files ?? [],
-      units: opened.units ?? [],
+      input_files: opened.input_files,
+      units: opened.units,
     });
     return ok(
       createAnalysisExecution(result, this.#identity, {

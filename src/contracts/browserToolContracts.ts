@@ -23,6 +23,7 @@ import {
   browserCaptureComparisonInputSchema,
   browserCaptureComparisonSchema,
 } from "../domain/browserCaptureComparison.js";
+import { DEFAULT_BROWSER_SCENARIO_CAPTURE_LIMITS } from "../domain/browserScenarioCaptureLimits.js";
 import {
   captureWebScreenshotInputSchema,
   compareWebScreenshotsInputSchema,
@@ -84,6 +85,8 @@ const exampleScenarioCapture = () => ({
       response_body: false,
       header_values: false,
     },
+    event_families: [],
+    limits: DEFAULT_BROWSER_SCENARIO_CAPTURE_LIMITS,
   },
   duration_ms: 10,
   steps: [
@@ -116,7 +119,16 @@ const exampleScenarioCapture = () => ({
       completeness: scenarioCompleteness,
     },
   ],
-  events: { retained: 0, dropped: 0, items: [] },
+  events: {
+    retained: 0,
+    dropped: 0,
+    items: [],
+    omissions: {
+      by_kind: [],
+      network_transactions: [],
+      network_transaction_range: null,
+    },
+  },
   completeness: scenarioCompleteness,
   limitations: [],
 });
@@ -223,7 +235,7 @@ export const BROWSER_TOOL_CONTRACTS = [
     name: "compare_web_captures",
     ...toolContractMetadata("compare_web_captures"),
     description:
-      "Compare passive web captures by providing before and after, each with the complete inspect_web_page normalized_result in inspection and an optional complete discover_webmcp_tools normalized_result in webmcp; or compare recorded scenarios by passing complete capture_browser_scenario normalized_result objects in before_scenario and after_scenario with an optional normalization policy. Use exactly one input group. Scenario comparison aligns exact step IDs, records deterministic literal normalization, and returns every artifact-level difference plus alignment failures inline. Missing or truncated evidence never proves equality.",
+      "Compare passive web captures by providing before and after, each with the complete inspect_web_page normalized_result in inspection and an optional complete discover_webmcp_tools normalized_result in webmcp; or compare recorded scenarios by passing complete capture_browser_scenario normalized_result objects in before_scenario and after_scenario with an optional normalization policy. Use exactly one input group. Network comparison includes observed HTTP requests and WebSocket frame streams; same-URL connections are compared as an unordered collection of ordered streams, retaining connection counts without claiming stable identity between individual connections. Scenario comparison aligns exact step IDs, records deterministic literal normalization, and returns every artifact-level difference plus alignment failures inline. Missing or truncated evidence never proves equality.",
     kind: "browser-provider",
     inputSchema: browserCaptureComparisonInputSchema,
     outputSchema: captureDiffOutputSchema,

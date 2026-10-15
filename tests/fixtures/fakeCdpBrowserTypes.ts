@@ -13,6 +13,8 @@ export interface FakeCdpBrowser {
   readonly commands: readonly FakeCdpCommand[];
   /** Actual WebSocket connections still held by the wire fixture. */
   activeConnectionCount(): number;
+  /** WebSocket upgrades accepted over the fixture's lifetime. */
+  openedConnectionCount(): number;
   /** Deliver actual malformed wire data without bypassing the production transport parser. */
   emitRawMessage(message: string): void;
   emitEvent(event: {
@@ -89,8 +91,11 @@ export interface FakeOptions {
   readonly responseAfterMalformedUrl?: string;
   readonly unrelatedWorker?: boolean;
   readonly binaryWebSocketEvent?: boolean;
+  /** Emit an allowed WebSocket creation without any frames in the capture window. */
+  readonly webSocketWithoutFrames?: boolean;
   readonly invalidBinaryWebSocketEvent?: boolean;
   readonly sourceMapBody?: string;
+  readonly sourceMapRedirect?: string;
   readonly sessionTimeline?:
     | "same_origin"
     | "outside_policy"
@@ -102,6 +107,7 @@ export interface FakeOptions {
   readonly cachedResponseBody?: string;
   readonly invalidResponseBodyBase64?: boolean;
   readonly webMcpTools?: boolean;
+  readonly webMcpConsequential?: JsonValue;
   readonly webMcpSameUrlRegistrations?: "retain" | "remove-second";
   readonly webMcpFrameCount?: number;
   readonly webMcpSchemaPropertyCount?: number;
@@ -111,6 +117,8 @@ export interface FakeOptions {
   readonly webMcpChildRecoversAfterTransient?: boolean;
   readonly webMcpChildNavigatesAllowed?: boolean;
   readonly electronFileUrl?: string;
+  /** Omit attached from the Electron page's HTTP discovery target. */
+  readonly omitElectronTargetAttachmentState?: boolean;
   readonly duplicateElectronInventory?: boolean;
   readonly electronInventoryCount?: number;
   readonly urlShapedAllowedTitle?:

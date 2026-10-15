@@ -18,6 +18,7 @@ import {
   semanticObligationPolicy,
   type ReconstructionObligationCandidatePolicy,
 } from "./ReconstructionObligationPolicies.js";
+import { compareUnicodeCodePoints } from "../domain/unicodeCodePointOrder.js";
 
 type CandidateFields = Omit<
   ReconstructionObligation,
@@ -54,7 +55,7 @@ export const deriveReconstructionObligationCandidates = (
     addCandidate(candidates, reviewedCandidate(obligation, records));
   return {
     candidates: [...candidates.values()].sort((left, right) =>
-      left.obligation_id.localeCompare(right.obligation_id),
+      compareUnicodeCodePoints(left.obligation_id, right.obligation_id),
     ),
     limitations: [...limitations].sort(),
   };
@@ -412,7 +413,22 @@ const addCandidate = (
       ...current.authority_references,
       ...candidate.authority_references,
     ]),
-    definitionCount: current.definitionCount + candidate.definitionCount,
+    // Each observation keeps its own unresolved authority and next steps.
+    unavailable_authority: uniqueBy(
+      [...current.unavailable_authority, ...candidate.unavailable_authority],
+      (item) => item,
+    ),
+    required_next_evidence: uniqueBy(
+      [...current.required_next_evidence, ...candidate.required_next_evidence],
+      (item) => item,
+    ),
+    // A generated ID digests its derivation key, so two generated candidates
+    // with one ID are the same claim seen by several records. Only another
+    // reviewed definition can introduce a competing definition.
+    definitionCount:
+      current.origin === "generated" && candidate.origin === "generated"
+        ? current.definitionCount
+        : current.definitionCount + candidate.definitionCount,
   });
 };
 
@@ -430,7 +446,7 @@ const uniqueBy = <Value>(
   key: (value: Value) => string,
 ): Value[] =>
   [...new Map(values.map((value) => [key(value), value])).values()].sort(
-    (left, right) => key(left).localeCompare(key(right)),
+    (left, right) => compareUnicodeCodePoints(key(left), key(right)),
   );
 
 const obligationId = (key: string): string =>
